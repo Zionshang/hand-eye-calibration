@@ -1,0 +1,7 @@
+lcm
+pyrealsense2
+opencv-python
+numpy
+scipy
+pynput
+click
