@@ -1,4 +1,5 @@
 import time
+import json
 import cv2
 import click
 import numpy as np
@@ -6,27 +7,35 @@ import pyrealsense2 as rs
 from pynput import keyboard
 from communication.lcm.lcm_client import Arx5LcmClient
 
-# --- Configuration & Calibration Constants ---
-CAMERA_MATRIX = np.array([
-    [435.75595576, 0.0, 423.51395880],
-    [0.0, 435.67409149, 243.52290173],
-    [0.0, 0.0, 1.0]
-])
-DIST_COEFFS = np.array([-0.06143892, 0.11244468, -0.00089222, 0.00102268, -0.09769306])
-
-R_HAND_EYE = np.array([
-    [-0.01029582, -0.29120562, 0.95660508],
-    [-0.99972631, -0.01710000, -0.01596544],
-    [0.02100717, -0.95650765, -0.29094986]
-])
-T_HAND_EYE = np.array([[-0.13248165], [0.01369959], [0.09316643]])
-
-H_HAND_EYE = np.eye(4)
-H_HAND_EYE[:3, :3] = R_HAND_EYE
-H_HAND_EYE[:3, 3] = T_HAND_EYE.flatten()
+# --- Global Vars (Loaded in main) ---
+CAMERA_MATRIX = None
+DIST_COEFFS = None
+H_HAND_EYE = None
 
 XX, YY = 11, 8
-SQUARE_SIZE = 0.015
+SQUARE_SIZE = 0.02
+
+def load_calibration_data(method_name="Tsai"):
+    global CAMERA_MATRIX, DIST_COEFFS, H_HAND_EYE
+    with open("calibration_result.json", "r") as f:
+        data = json.load(f)
+    
+    CAMERA_MATRIX = np.array(data["intrinsics"]["camera_matrix"])
+    DIST_COEFFS = np.array(data["intrinsics"]["dist_coeffs"])
+    
+    if method_name not in data["methods"]:
+        print(f"Warning: Method {method_name} not found. Using Tsai.")
+        method_name = "Tsai"
+        
+    m = data["methods"][method_name]
+    R = np.array(m["R"])
+    t = np.array(m["T"]).reshape(3, 1)
+    
+    H_HAND_EYE = np.eye(4)
+    H_HAND_EYE[:3, :3] = R
+    H_HAND_EYE[:3, 3] = t.flatten()
+    print(f"Loaded Calibration: {method_name}")
+
 
 def euler_to_R(rx, ry, rz):
     roll, pitch, yaw = rx, ry, rz
@@ -52,9 +61,27 @@ def get_target_touch_pose(image, current_ee_pose):
     objp = np.zeros((XX * YY, 3), np.float32)
     objp[:, :2] = np.mgrid[0:XX, 0:YY].T.reshape(-1, 2) * SQUARE_SIZE
     
-    success, _, tvec = cv2.solvePnP(objp, corners2, CAMERA_MATRIX, DIST_COEFFS)
+    success, rvec, tvec = cv2.solvePnP(objp, corners2, CAMERA_MATRIX, DIST_COEFFS)
     if not success: return None
-    p_in_cam = np.append(tvec.flatten(), 1.0)
+
+    # Target the 1st Row, 1st Column corner (Top-Left) (0-based index: Row 0, Col 0)
+    # Coordinate in Object Frame: (0, 0, 0)
+    target_obj_point = np.array([[0.0, 0.0, 0.0]]) 
+
+    # Visualize target point (Project target_obj_point to image)
+    points_2d, _ = cv2.projectPoints(target_obj_point, rvec, tvec, CAMERA_MATRIX, DIST_COEFFS)
+    target_pix = tuple(map(int, points_2d[0].ravel()))
+
+    cv2.drawChessboardCorners(image, (XX, YY), corners2, ret)
+    cv2.circle(image, target_pix, 10, (0, 0, 255), -1)
+    cv2.imshow("Corners", image)
+    cv2.waitKey(1)
+
+    # Transform target point from Object Frame to Camera Frame
+    # P_cam = R * P_obj + T
+    R_mat, _ = cv2.Rodrigues(rvec)
+    p_in_cam_3d = R_mat @ target_obj_point.T + tvec # shape (3, 1)
+    p_in_cam = np.append(p_in_cam_3d.flatten(), 1.0)
 
     # Result = T_base_end @ T_end_cam @ P_in_cam
     p_in_base = pose_to_H(current_ee_pose) @ H_HAND_EYE @ p_in_cam
@@ -62,6 +89,7 @@ def get_target_touch_pose(image, current_ee_pose):
     target_cmd = np.zeros(6)
     target_cmd[:3] = p_in_base[:3]
     target_cmd[3:] = [0.0, np.pi / 2.0, 0.0] # Pitch 90 deg
+    target_cmd[2] += 0.03  # Offset above the board
     return target_cmd
 
 def start_verification_task(client, pipeline):
@@ -70,53 +98,74 @@ def start_verification_task(client, pipeline):
     print(" [Space] : Reset Home")
     print(" [Q]     : Quit")
 
-    key_pressed = {
-        keyboard.KeyCode.from_char("h"): False,
-        keyboard.KeyCode.from_char("q"): False,
-        keyboard.Key.space: False
+    key_map = {
+        'h': keyboard.KeyCode.from_char("h"),
+        'q': keyboard.KeyCode.from_char("q"),
+        'space': keyboard.Key.space
     }
+    # Flags to latch events
+    # We use a dict to store the state. True = Pending Request.
+    key_requests = {k: False for k in key_map.values()}
 
-    def on_press(key): 
-        if key in key_pressed: key_pressed[key] = True
-    def on_release(key): 
-        if key in key_pressed: key_pressed[key] = False
+    def on_press(key):
+        if key in key_requests: 
+            key_requests[key] = True
 
-    listener = keyboard.Listener(on_press=on_press, on_release=on_release)
+    # Remove on_release reset to avoid missing fast taps
+    # The flag will be reset manually in the main loop after processing
+    listener = keyboard.Listener(on_press=on_press)
     listener.start()
     
     cv2.namedWindow('Preview', cv2.WINDOW_NORMAL)
-    
-    # Checking Camera Stream
-    for _ in range(30):
-        if pipeline.poll_for_frames(): break
+
+    # Checking Camera Stream & Warping Up
+    for i in range(30):
+        frames = pipeline.poll_for_frames()
+        if frames:
+            color = frames.get_color_frame()
+            if color:
+                print("[Init] Camera OK!")
+                break
+        time.sleep(0.1)
     else:
-        print("[Error] No Frames Received!")
-        return
+        print("[Warning] Camera stream check timeout!")
 
-    # Moving to Ready Pose
-    client.set_ee_pose(np.array([0.16, 0.0, 0.3, 0.0, 0.62, 0.0]), gripper_pos=0, preview_time=3.0)
-    time.sleep(3.0)
+    # Init robot pose with continuous command stream
+    target_ready = np.array([0.25, 0.0, 0.17, 0.0, 1.2, 0.0])
 
+    # Send command continuously to ensure execution 
+    client.set_ee_pose(target_ready, gripper_pos=0.0, preview_time=3.0)
+    time.sleep(3.5)
+    
     start_time = time.monotonic()
-    last_h = False
+    
+    # We remove last_h logic because we now consume events
+    # last_h = False 
 
     while True:
         # 1. Update State & Print
+        # ... existing code ...
         state = client.get_state()
         ee_pose = state["ee_pose"]
         print(f"Time: {time.monotonic() - start_time:.1f}s | Pose: {ee_pose[:3]}", end="\r")
 
-        # 2. Key Inputs
-        key_h = key_pressed[keyboard.KeyCode.from_char("h")]
-        key_q = key_pressed[keyboard.KeyCode.from_char("q")]
-        key_space = key_pressed[keyboard.Key.space]
+        # Handle cv2 keys (backup for window focus)
+        # Using waitKey(1) inside loop is good for GUI responsiveness
+        # And we merge it into our request flags
+        key_cv = cv2.waitKey(1) & 0xFF
+        if key_cv == ord('h'): key_requests[key_map['h']] = True
+        elif key_cv == ord('q'): key_requests[key_map['q']] = True
+        elif key_cv == 32: key_requests[key_map['space']] = True # Space
 
-        if key_q: break
+        # 2. Process Requests
+        if key_requests[key_map['q']]: 
+            break
         
-        if key_space:
+        if key_requests[key_map['space']]:
             print("\n[Cmd] Resetting to Home...", end="\r")
             client.reset_to_home()
             start_time = time.monotonic()
+            key_requests[key_map['space']] = False # Reset flag
             continue
 
         frames = pipeline.poll_for_frames()
@@ -126,9 +175,9 @@ def start_verification_task(client, pipeline):
             if color:
                 img = np.asanyarray(color.get_data())
                 cv2.imshow("Preview", img)
-                cv2.waitKey(1)
+                # waitKey is already called above
 
-        if key_h and not last_h and img is not None:
+        if key_requests[key_map['h']] and img is not None:
             print("\n[Cmd] Calculating Target...")
             target = get_target_touch_pose(img, ee_pose)
             if target is not None:
@@ -136,16 +185,24 @@ def start_verification_task(client, pipeline):
                 client.set_ee_pose(target, gripper_pos=0, preview_time=3.0)
             else:
                 print(" -> Board not found!")
+            
+            # Reset flag after processing (Debounce/One-shot)
+            key_requests[key_map['h']] = False 
 
-        last_h = key_h
+        # Short sleep to prevent CPU hogging (optional if IO bound)
         time.sleep(0.01)
 
 @click.command()
 @click.option("--address", default="239.255.76.67", help="LCM address")
 @click.option("--port", default=7667, help="LCM port")
-def main(address, port):
+@click.option("--method", default="Tsai", help="Calib method: Tsai, Park, Horaud, Daniilidis")
+def main(address, port, method):
+    load_calibration_data(method)
+
     client = Arx5LcmClient(url="", address=address, port=port, ttl=1)
-    
+    client.reset_to_home()
+    print("Robot initialized.")
+
     pipeline = rs.pipeline()
     config = rs.config()
     config.enable_stream(rs.stream.color, 848, 480, rs.format.bgr8, 30)
