@@ -32,7 +32,16 @@ def get_intrinsics():
         print(f"[[{intrinsics.fx:.5f}, 0.00000, {intrinsics.ppx:.5f}],")
         print(f" [0.00000, {intrinsics.fy:.5f}, {intrinsics.ppy:.5f}],")
         print(f" [0.00000, 0.00000, 1.00000]]")
-        print("=================================================")
+        
+        # Get depth scale (FACTOR_DEPTH)
+        try:
+            depth_sensor = profile.get_device().first_depth_sensor()
+            depth_scale = depth_sensor.get_depth_scale()
+            factor_depth = 1.0 / depth_scale
+            print(f"\nFACTOR_DEPTH (Depth Scale): {factor_depth}")
+        except Exception as e:
+            print(f"\nWarning: Could not get depth scale - {e}")
+        print("=")
 
     except Exception as e:
         print(f"Error: {e}")
