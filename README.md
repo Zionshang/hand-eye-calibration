@@ -1,8 +1,4 @@
-# Hand-Eye Calibration for Arx5 Robot# Hand-Eye Calibration for Arx5_umi Robot
-
-
-
-This toolkit performs **Eye-in-Hand** calibration between an `Arx5` robot arm and a `RealSense D405` camera.
+# Hand-Eye Calibration for Arx5_umi Robot
 
 This repository provides a complete toolkit for performing **Eye-in-Hand** calibration between an `Arx5` robot arm and an Intel `RealSense D405` camera. The pipeline supports data collection, calibration computation using multiple OpenCV algorithms, and physical verification.
 
@@ -39,7 +35,6 @@ Teleoperate the robot to capture chessboard images paired with poses.
 
 - **Controls**: Keyboard keys to move robot .
 - **H**: Save current image & pose.
-- **Arx5 SDK**: Ensure the SDK is in your `PYTHONPATH`.
 - **Space**: Reset to Home.
 
 ## 3. Compute Calibration
@@ -58,7 +53,7 @@ Verify accuracy by commanding the robot to touch the chessboard corner using the
 
 ```bash
 
-python verify_calibration_lcm.py --method Tsai
+./run_verify.sh --method Horaud
 
 # Options: Tsai, Park, Horaud, Daniilidis
 

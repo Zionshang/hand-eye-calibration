@@ -5,6 +5,7 @@ A2^{-1}*A1*X=X*B2*B1^{−1}
 """
 
 import os
+import json
 
 import cv2
 import numpy as np
@@ -125,7 +126,7 @@ def camera_calibrate(iamges_path):
 
     print("++++++++++相机标定完成++++++++++++++")
 
-    return rvecs, tvecs, valid_indices
+    return rvecs, tvecs, valid_indices, mtx, dist
 
 
 def process_arm_pose(arm_pose_file, valid_indices):
@@ -150,28 +151,15 @@ def process_arm_pose(arm_pose_file, valid_indices):
             
     return R_arm, t_arm
 
-
-def invert_pose(R, t):
-    """
-    Calculate the inverse of a rigid body transformation.
-    Given R, t such that P_new = R * P_old + t
-    Returns R_inv, t_inv such that P_old = R_inv * P_new + t_inv
-    """
-    R_inv = R.T
-    t_inv = -np.dot(R_inv, t)
-    return R_inv, t_inv
-
-
 def hand_eye_calibrate():
-    rvecs, tvecs, valid_indices = camera_calibrate(iamges_path=iamges_path)
+    rvecs, tvecs, valid_indices, mtx, dist = camera_calibrate(iamges_path=iamges_path)
     # 将 valid_indices 传递给 process_arm_pose，确保位姿与图片一一对应
     R_arm, t_arm = process_arm_pose(arm_pose_file=arm_pose_file, valid_indices=valid_indices)
     
     # 确保用于手眼标定的数据长度一致
     assert len(R_arm) == len(rvecs) == len(tvecs), "数据长度不一致！"
 
-    print("\n========== 1. cv2.calibrateHandEye (5 Methods) ==========")
-    # Methods for cv2.calibrateHandEye
+    print("\n========== cv2.calibrateHandEye (5 Methods) ==========")
     methods_he = [
         ("Tsai", cv2.CALIB_HAND_EYE_TSAI),
         ("Park", cv2.CALIB_HAND_EYE_PARK),
@@ -180,78 +168,37 @@ def hand_eye_calibrate():
         ("Daniilidis", cv2.CALIB_HAND_EYE_DANIILIDIS)
     ]
 
-    # R_arm is R_gripper2base (Gripper -> Base) because it's the pose of gripper in base.
-    # calibHandEye expects gripper2base and target2cam (which is rvecs/tvecs)
-    
+    results = {
+        "intrinsics": {
+            "camera_matrix": mtx.tolist(),
+            "dist_coeffs": dist.flatten().tolist()
+        },
+        "methods": {}
+    }
+
+    last_R, last_T = None, None
+
     for name, method in methods_he:
         try:
             R_cam2grp, t_cam2grp = cv2.calibrateHandEye(R_arm, t_arm, rvecs, tvecs, method=method)
             print(f"--- Method: {name} ---")
             print("R_cam2gripper:\n", R_cam2grp)
             print("t_cam2gripper:\n", t_cam2grp.flatten())
+            
+            results["methods"][name] = {
+                "R": R_cam2grp.tolist(),
+                "T": t_cam2grp.flatten().tolist()
+            }
+            last_R, last_T = R_cam2grp, t_cam2grp
         except Exception as e:
             print(f"--- Method: {name} Failed: {e} ---")
 
-    print("\n========== 2. cv2.calibrateRobotWorldHandEye (2 Methods) ==========")
-    # Methods for cv2.calibrateRobotWorldHandEye
-    methods_rwhe = [
-        ("Shah", cv2.CALIB_ROBOT_WORLD_HAND_EYE_SHAH),
-        ("Li", cv2.CALIB_ROBOT_WORLD_HAND_EYE_LI)
-    ]
+    # Save to JSON
+    with open('calibration_result.json', 'w') as f:
+        json.dump(results, f, indent=4)
+    print("\n结果已保存到 calibration_result.json")
 
-    # calibrateRobotWorldHandEye expects:
-    # 1. R_world2cam, t_world2cam (World -> Camera). this is rvecs, tvecs.
-    # 2. R_base2gripper, t_base2gripper (Base -> Gripper).
-    #    We have R_arm (Gripper -> Base). So we need to INVERT it.
-    
-    R_b2g_list, t_b2g_list = [], []
-    for R, t in zip(R_arm, t_arm):
-        Ri, ti = invert_pose(R, t)
-        R_b2g_list.append(Ri)
-        t_b2g_list.append(ti)
-    
-    for name, method in methods_rwhe:
-        try:
-            R_base2world, t_base2world, R_grp2cam, t_grp2cam = cv2.calibrateRobotWorldHandEye(
-                rvecs, tvecs, R_b2g_list, t_b2g_list, method=method
-            )
-            
-            # Result is Gripper -> Camera. We want Camera -> Gripper.
-            # So invert the result.
-            R_cam2grp, t_cam2grp = invert_pose(R_grp2cam, t_grp2cam)
-            
-            print(f"--- Method: {name} ---")
-            print("R_cam2gripper:\n", R_cam2grp)
-            print("t_cam2gripper:\n", t_cam2grp.flatten())
-            # print("R_base2world:\n", R_base2world) # Optional: World wrt Base
-        except Exception as e:
-            print(f"--- Method: {name} Failed: {e} ---")
-
-    print("+++++++++++++++++++++++++++++++++++++++++++")
-
-    # Validation: Check Board consistency in Base frame using the last computed calibrationResult
-    # T_board_in_base = T_end_base * T_cam_end * T_board_cam
-    print("\n=== Validation (Board Position in Base) ===")
-    
-    RT_cam2end = np.eye(4)
-    RT_cam2end[:3, :3] = R_cam2grp
-    RT_cam2end[:3, 3] = t_cam2grp.flatten()
-    
-    for k in range(min(10, len(R_arm))): 
-        RT_eb = np.eye(4)
-        RT_eb[:3, :3] = R_arm[k]
-        RT_eb[:3, 3] = t_arm[k].flatten()
-        
-        RT_bc = np.eye(4)
-        rmat, _ = cv2.Rodrigues(rvecs[k])
-        RT_bc[:3, :3] = rmat
-        RT_bc[:3, 3] = tvecs[k].flatten()
-        
-        RT_final = RT_eb @ RT_cam2end @ RT_bc
-        print(f"Frame {k} pos: {RT_final[:3, 3].flatten()}")
-
-    # Return last result or one of them (e.g. Shah) for main block compatibility
-    return R_cam2grp, t_cam2grp
+    return last_R, last_T
 
 
 if __name__ == "__main__":
